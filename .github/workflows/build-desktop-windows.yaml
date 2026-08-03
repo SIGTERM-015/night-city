@@ -11,7 +11,7 @@
 #   4. Authenticates to GCP via Workload Identity Federation (no JSON keys).
 #   5. Uploads the Velopack release to the GCS download bucket at the correct
 #      feed path so the client's built-in auto-updater can consume it.
-#   6. Attaches the Velopack Setup.exe as a workflow artifact for first-time installs.
+#   6. Attaches the Velopack installer as a workflow artifact for first-time installs.
 #   7. Prunes old releases, keeping only current + previous.
 #
 # WHY workflow_dispatch WITH A COMMIT SHA:
@@ -31,7 +31,7 @@
 #   The client constructs its update URL as:
 #     ${UPDATE_API_ENDPOINT}/dl/desktop/${BUILD_CHANNEL}/${process.platform}/${DESKTOP_DOWNLOAD_ARCH}/${DESKTOP_BUILD_VARIANT}
 #   For our build: dl/desktop/canary/win32/x64/windows-game-capture/
-#   The Velopack RELEASES file and .nupkg packages go under this prefix.
+#   The Velopack releases.win.json, .nupkg packages, and Setup go under this prefix.
 # =============================================================================
 
 name: Build Desktop Client (Windows)
@@ -74,6 +74,15 @@ env:
   FLUXER_DESKTOP_BUILD_VARIANT: windows-game-capture
   DESKTOP_DOWNLOAD_ARCH: x64
   PLATFORM: win32
+
+  # --- Velopack pack ID ---
+  # MUST match WINDOWS_VELOPACK_ID in src/common/DesktopIdentity.ts.
+  # The client's UpdateManager matches releases by this ID, and Velopack
+  # installs to %LocalAppData%\{packId}. Changing it silently breaks
+  # updates for every installed client.
+  #   canary → fluxer_desktop_canary
+  #   stable → fluxer_desktop
+  VELOPACK_PACK_ID: fluxer_desktop_canary
 
   # --- GCP configuration ---
   # These must match the Pulumi stack outputs.
@@ -185,15 +194,52 @@ jobs:
       # 6. Pack with Velopack
       #    electron-builder produces an unpacked directory at
       #    dist-electron/win-unpacked. Velopack's vpk pack turns this into
-      #    the release artifacts the auto-updater expects: a RELEASES file
-      #    and .nupkg packages.
+      #    the release artifacts the auto-updater expects:
+      #      - releases.win.json  (modern feed — UpdateManager reads this)
+      #      - {packId}-{ver}-full.nupkg
+      #      - {packId}-Setup.exe
+      #      - RELEASES  (legacy, for Squirrel migration)
       #
       #    electron-builder does NOT produce Velopack packages — it produces
       #    NSIS installers. Without this step we would publish installers to
       #    a feed the client's Velopack UpdateManager cannot read.
+      #
+      #    EXECUTABLE DETECTION:
+      #    electron-builder.config.cjs sets productName based on BUILD_CHANNEL
+      #    ("Fluxer Canary" for canary, "Fluxer" for stable). The .exe name
+      #    follows productName, so we derive the expected name from the channel
+      #    and assert it exists. This is safer than scanning for .exe files
+      #    because win-unpacked/ can contain other executables (elevate.exe,
+      #    game capture helpers under resources/).
       # =====================================================================
       - name: Install Velopack CLI
         run: dotnet tool install -g vpk
+
+      - name: Detect main executable
+        id: detect-exe
+        working-directory: fluxer_desktop
+        run: |
+          # Derive the expected executable name from BUILD_CHANNEL.
+          # electron-builder.config.cjs: productName = isCanary ? 'Fluxer Canary' : 'Fluxer'
+          if ("${{ env.BUILD_CHANNEL }}" -eq "canary") {
+            $expectedExe = "Fluxer Canary.exe"
+          } else {
+            $expectedExe = "Fluxer.exe"
+          }
+
+          $exePath = "dist-electron\win-unpacked\$expectedExe"
+          if (-not (Test-Path $exePath)) {
+            Write-Host "::error::Expected executable not found: $exePath"
+            Write-Host "::error::Contents of dist-electron\win-unpacked\:"
+            Get-ChildItem "dist-electron\win-unpacked" -Filter "*.exe" | ForEach-Object {
+              Write-Host "::error::  $($_.Name)"
+            }
+            Write-Host "::error::BUILD_CHANNEL=${{ env.BUILD_CHANNEL }}, expected productName-derived exe: $expectedExe"
+            exit 1
+          }
+
+          Write-Host "Found main executable: $expectedExe"
+          echo "MAIN_EXE=$expectedExe" >> $env:GITHUB_OUTPUT
 
       - name: Pack Velopack release
         # Must run inside fluxer_desktop/ where electron-builder wrote
@@ -201,11 +247,47 @@ jobs:
         working-directory: fluxer_desktop
         run: |
           vpk pack `
-            --packId Fluxer `
+            --packId "${{ env.VELOPACK_PACK_ID }}" `
             --packVersion ${{ inputs.build_version }} `
             --packDir dist-electron/win-unpacked `
-            --mainExe Fluxer.exe `
+            --mainExe "${{ steps.detect-exe.outputs.MAIN_EXE }}" `
             --outputDir velopack-release
+
+      - name: Verify Velopack output
+        working-directory: fluxer_desktop
+        run: |
+          # Verify all expected output files exist before uploading.
+          # Velopack output filenames: {packId}-{ver}-full.nupkg, {packId}-Setup.exe,
+          # releases.win.json, RELEASES (legacy).
+          $packId = "${{ env.VELOPACK_PACK_ID }}"
+          $version = "${{ inputs.build_version }}"
+          $outDir = "velopack-release"
+
+          $requiredFiles = @(
+            "$outDir\releases.win.json",
+            "$outDir\$packId-$version-full.nupkg",
+            "$outDir\$packId-Setup.exe"
+          )
+
+          $missing = @()
+          foreach ($f in $requiredFiles) {
+            if (-not (Test-Path $f)) {
+              $missing += $f
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::Missing expected Velopack output files:"
+            foreach ($f in $missing) {
+              Write-Host "::error::  $f"
+            }
+            Write-Host "::error::Actual contents of ${outDir}:"
+            Get-ChildItem $outDir | ForEach-Object { Write-Host "::error::  $($_.Name)" }
+            exit 1
+          }
+
+          Write-Host "Velopack output verified:"
+          Get-ChildItem $outDir | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1MB, 1)) MB)" }
 
       # =====================================================================
       # 7. Authenticate to GCP via Workload Identity Federation
@@ -224,19 +306,32 @@ jobs:
 
       # =====================================================================
       # 8. Upload Velopack release to GCS
-      #    - RELEASES file: no-cache (clients must see new releases immediately)
+      #    - releases.win.json: no-cache (UpdateManager reads this to find updates)
+      #    - RELEASES: no-cache (legacy feed for Squirrel migration)
       #    - .nupkg packages: immutable (uniquely named per version)
+      #    - {packId}-Setup.exe: no-cache (first-time installer)
       #    The feed path matches the client's URL construction.
       # =====================================================================
       - name: Upload Velopack release to GCS
         # vpk wrote its output to fluxer_desktop/velopack-release/.
         working-directory: fluxer_desktop
         run: |
-          # Upload RELEASES file with no-cache (feed metadata must be fresh)
+          $packId = "${{ env.VELOPACK_PACK_ID }}"
+
+          # Upload releases.win.json — the modern feed file that UpdateManager reads.
+          # Without this file, the client's auto-updater will never find updates.
           gcloud storage cp `
-            "velopack-release/RELEASES" `
-            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/RELEASES" `
+            "velopack-release/releases.win.json" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/releases.win.json" `
             --cache-control="no-cache"
+
+          # Upload RELEASES file with no-cache (legacy feed for Squirrel migration)
+          if (Test-Path "velopack-release/RELEASES") {
+            gcloud storage cp `
+              "velopack-release/RELEASES" `
+              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/RELEASES" `
+              --cache-control="no-cache"
+          }
 
           # Upload .nupkg packages with long cache (immutable, uniquely named)
           gcloud storage cp `
@@ -244,24 +339,22 @@ jobs:
             "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/" `
             --cache-control="public, max-age=31536000, immutable"
 
-          # Upload Setup.exe (Velopack's bootstrapper for first-time installs)
-          if (Test-Path "velopack-release/Setup.exe") {
-            gcloud storage cp `
-              "velopack-release/Setup.exe" `
-              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/Setup.exe" `
-              --cache-control="no-cache"
-          }
+          # Upload Setup.exe (Velopack names it {packId}-Setup.exe)
+          gcloud storage cp `
+            "velopack-release/$packId-Setup.exe" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/$packId-Setup.exe" `
+            --cache-control="no-cache"
 
       # =====================================================================
-      # 9. Attach Velopack Setup.exe as a workflow artifact
-      #    The Setup.exe is Velopack's bootstrapper for first-time installs.
+      # 9. Attach Velopack Setup as a workflow artifact
+      #    Velopack names the installer {packId}-Setup.exe.
       #    It is already uploaded to GCS in step 8 above.  We also attach it
       #    as a GitHub Actions artifact so an operator can hand it to someone
       #    directly from the run page without GCS access.
       #
       #    NOTE: electron-builder.config.cjs sets winTargets = [{ target: 'dir' }]
       #    and the build step uses --dir, so NO NSIS installer is produced.
-      #    The only first-install .exe is the Velopack Setup.exe.
+      #    The only first-install .exe is the Velopack Setup.
       #
       #    actions/upload-artifact resolves `path` relative to the workspace
       #    root ($GITHUB_WORKSPACE), NOT to working-directory.
@@ -270,7 +363,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fluxer-desktop-installer-${{ inputs.build_version }}
-          path: fluxer_desktop/velopack-release/Setup.exe
+          path: fluxer_desktop/velopack-release/${{ env.VELOPACK_PACK_ID }}-Setup.exe
           if-no-files-found: warn
           retention-days: 30
 
@@ -287,10 +380,14 @@ jobs:
       #     ALGORITHM:
       #     1. List all .nupkg files under the feed prefix.
       #     2. Parse version numbers from filenames.
+      #        Velopack names: {packId}-{version}-full.nupkg
+      #        The packId can contain underscores, so we anchor on the
+      #        version-suffix-extension pattern, not on a simple dash.
       #     3. Sort by version descending.
       #     4. Keep the two most recent versions' files.
       #     5. Delete everything older.
-      #     6. Never delete RELEASES or Setup.exe (always current).
+      #     6. Never delete releases.win.json, RELEASES, or *-Setup.exe
+      #        (always current — overwritten each build).
       #
       #     SAFETY: if there are 2 or fewer versions, nothing is deleted.
       # =====================================================================
@@ -304,12 +401,15 @@ jobs:
             exit 0
           }
 
-          # Collect .nupkg files and extract versions
+          # Collect .nupkg files and extract versions.
+          # Velopack filenames: {packId}-{version}-{type}.nupkg
+          # where version is semver (e.g. 2026.802.120000) and type is "full" or "delta".
+          # The packId may contain underscores/hyphens, so we match the version
+          # by anchoring on the -full.nupkg or -delta.nupkg suffix.
           $packages = @()
           foreach ($obj in $objects) {
             if ($obj -match '\.nupkg$') {
-              # Velopack names packages as PackageId-Version-full.nupkg or similar
-              if ($obj -match '-(\d+\.\d+\.\d+)') {
+              if ($obj -match '-(\d+\.\d+\.\d+(?:\.\d+)*)-(full|delta)\.nupkg$') {
                 $packages += [PSCustomObject]@{
                   Path = $obj
                   Version = $Matches[1]
