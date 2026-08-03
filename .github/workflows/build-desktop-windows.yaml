@@ -4,15 +4,26 @@
 # LOCATION: This file lives in the IaC repo at ci/github/build-desktop-windows.yaml.
 #           Copy it to the fork at .github/workflows/build-desktop-windows.yaml.
 #
-# WHAT IT DOES:
-#   1. Checks out the Fluxer fork at a specific upstream commit SHA.
-#   2. Builds the Electron desktop client with the windows-game-capture variant.
-#   3. Packs the build output into a Velopack release (vpk pack).
-#   4. Authenticates to GCP via Workload Identity Federation (no JSON keys).
-#   5. Uploads the Velopack release to the GCS download bucket at the correct
-#      feed path so the client's built-in auto-updater can consume it.
-#   6. Attaches the Velopack installer as a workflow artifact for first-time installs.
-#   7. Prunes old releases, keeping only current + previous.
+# WHAT IT DOES (two jobs):
+#   build:
+#     1. Checks out the Fluxer fork at a specific upstream commit SHA.
+#     2. Builds the Electron desktop client with the windows-game-capture variant.
+#     3. Uploads the unpacked Electron app as a workflow artifact.
+#
+#   package-publish:
+#     4. Downloads the build artifact.
+#     5. Packs the build output into a Velopack release (vpk pack).
+#     6. Authenticates to GCP via Workload Identity Federation (no JSON keys).
+#     7. Uploads the Velopack release to the GCS download bucket at the correct
+#        feed path so the client's built-in auto-updater can consume it.
+#     8. Attaches the Velopack installer as a workflow artifact for first-time installs.
+#     9. Prunes old releases, keeping only current + previous.
+#
+# WHY TWO JOBS:
+#   The build takes ~30 minutes (checkout, Rust compile, electron-builder).
+#   Packaging and upload take ~2 minutes. Every packaging bug was forcing a
+#   full recompile. With two jobs, a packaging failure can be retried with
+#   `gh run rerun --job <package-publish-job-id>` in 2 minutes, not 30.
 #
 # WHY workflow_dispatch WITH A COMMIT SHA:
 #   The desktop client is hard-coupled to the app-proxy image via bridgeVersion.
@@ -32,6 +43,19 @@
 #     ${UPDATE_API_ENDPOINT}/dl/desktop/${BUILD_CHANNEL}/${process.platform}/${DESKTOP_DOWNLOAD_ARCH}/${DESKTOP_BUILD_VARIANT}
 #   For our build: dl/desktop/canary/win32/x64/windows-game-capture/
 #   The Velopack releases.win.json, .nupkg packages, and Setup go under this prefix.
+#
+# VELOPACK OUTPUT FILENAMES:
+#   When no --channel is specified, Velopack defaults to the OS name ("win").
+#   The channel is embedded in filenames:
+#     {packId}-{ver}-full.nupkg          — update package (versioned, immutable)
+#     {packId}-{channel}-Setup.exe       — installer (overwritten each build)
+#     {packId}-{channel}-Portable.zip    — portable zip (overwritten each build)
+#     releases.{channel}.json            — modern feed for UpdateManager
+#     assets.{channel}.json              — build manifest (not needed for updates)
+#     RELEASES                           — legacy feed for Squirrel migration
+#   We do NOT hardcode exact filenames — we glob for *Setup.exe, *Portable.zip,
+#   and *.nupkg, asserting exactly the expected count. This has been more
+#   reliable than guessing Velopack's naming conventions.
 # =============================================================================
 
 name: Build Desktop Client (Windows)
@@ -56,10 +80,9 @@ on:
         required: true
         type: string
 
-# Permissions for Workload Identity Federation OIDC token exchange.
+# Workflow-level permissions. Each job narrows further via job-level permissions.
 permissions:
   contents: read
-  id-token: write
 
 # Only one desktop build at a time — a concurrent upload could corrupt
 # the feed by interleaving files from two releases.
@@ -96,9 +119,19 @@ env:
   FEED_PREFIX: dl/desktop/canary/win32/x64/windows-game-capture
 
 jobs:
-  build-and-publish:
+  # ===================================================================
+  # JOB 1: BUILD
+  # Checkout, verify ancestry, install toolchains, build, electron-builder.
+  # Uploads the unpacked Electron app as a workflow artifact so the
+  # package-publish job can consume it without rebuilding.
+  # ~30 minutes. Only re-run if the source code changed.
+  # ===================================================================
+  build:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
 
     steps:
       # =====================================================================
@@ -174,35 +207,85 @@ jobs:
       # =====================================================================
       - name: Build application
         env:
-          BUILD_CHANNEL: ${{ env.BUILD_CHANNEL }}
-          PUBLIC_RELEASE_CHANNEL: ${{ env.PUBLIC_RELEASE_CHANNEL }}
           PUBLIC_BUILD_VERSION: ${{ inputs.build_version }}
-          FLUXER_DESKTOP_BUILD_VARIANT: ${{ env.FLUXER_DESKTOP_BUILD_VARIANT }}
-        # working-directory ES OBLIGATORIO. En la raiz del monorepo el script
-        # "build" es `cargo run -p fluxer-dev -- build`, y el crate fluxer-dev
-        # NO compila en Windows (tools/dev/src/tunnel.rs:372 usa
-        # std::os::unix::net sin guarda #[cfg(unix)]). Ademas electron-builder
-        # solo es dependencia de fluxer_desktop, no de la raiz.
-        # Dentro de fluxer_desktop, "build" es `node scripts/build.mjs`, que es
-        # lo que queremos.
+        # working-directory is mandatory. At the monorepo root the "build"
+        # script is `cargo run -p fluxer-dev -- build`, and fluxer-dev does
+        # NOT compile on Windows. Inside fluxer_desktop, "build" is
+        # `node scripts/build.mjs`, which is what we want.
         working-directory: fluxer_desktop
         run: |
           pnpm build
           pnpm exec electron-builder --dir --config electron-builder.config.cjs
 
       # =====================================================================
-      # 6. Pack with Velopack
-      #    electron-builder produces an unpacked directory at
-      #    dist-electron/win-unpacked. Velopack's vpk pack turns this into
-      #    the release artifacts the auto-updater expects:
-      #      - releases.win.json  (modern feed — UpdateManager reads this)
-      #      - {packId}-{ver}-full.nupkg
-      #      - {packId}-Setup.exe
-      #      - RELEASES  (legacy, for Squirrel migration)
+      # 6. Upload the unpacked Electron app as a workflow artifact.
+      #    The package-publish job downloads this and feeds it to vpk pack.
       #
-      #    electron-builder does NOT produce Velopack packages — it produces
-      #    NSIS installers. Without this step we would publish installers to
-      #    a feed the client's Velopack UpdateManager cannot read.
+      #    upload-artifact@v4 compresses by default (zlib). The unpacked app
+      #    is ~300-500 MB; compression helps transfer speed between jobs.
+      #
+      #    Permission bits: upload-artifact does NOT preserve Unix permission
+      #    bits. This is irrelevant here — we are on Windows (NTFS) and the
+      #    consumer is also Windows.
+      #
+      #    retention-days: 1 — this artifact is only needed for the
+      #    package-publish job in the same run. Short retention prevents
+      #    accumulation of ~300 MB artifacts.
+      # =====================================================================
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-win-unpacked
+          path: fluxer_desktop/dist-electron/win-unpacked/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ===================================================================
+  # JOB 2: PACKAGE + PUBLISH
+  # Downloads the build artifact, packs with Velopack, uploads to GCS.
+  # ~2 minutes. Can be re-run independently on packaging failures:
+  #   gh run rerun --job <job-id>
+  # ===================================================================
+  package-publish:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    # This job authenticates to GCP via Workload Identity Federation,
+    # which requires id-token: write for the OIDC token exchange.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      # =====================================================================
+      # 1. Download the unpacked Electron app from the build job.
+      #
+      #    download-artifact@v4 with a single named artifact extracts
+      #    directly into the `path:` directory (no subdirectory created).
+      #    We download to fluxer_desktop/dist-electron/win-unpacked/ so
+      #    that working-directory: fluxer_desktop and
+      #    --packDir dist-electron/win-unpacked keep working unchanged.
+      # =====================================================================
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: electron-win-unpacked
+          path: fluxer_desktop/dist-electron/win-unpacked
+
+      # =====================================================================
+      # 2. Pack with Velopack
+      #    The downloaded artifact recreates dist-electron/win-unpacked/.
+      #    Velopack's vpk pack turns this into the release artifacts the
+      #    auto-updater expects.
+      #
+      #    VELOPACK OUTPUT (default channel = "win"):
+      #      {packId}-{ver}-full.nupkg       — update package
+      #      {packId}-win-Setup.exe           — installer
+      #      {packId}-win-Portable.zip        — portable distribution
+      #      releases.win.json                — modern feed
+      #      assets.win.json                  — build manifest (not uploaded)
+      #      RELEASES                         — legacy feed
       #
       #    EXECUTABLE DETECTION:
       #    electron-builder.config.cjs sets productName based on BUILD_CHANNEL
@@ -242,8 +325,6 @@ jobs:
           echo "MAIN_EXE=$expectedExe" >> $env:GITHUB_OUTPUT
 
       - name: Pack Velopack release
-        # Must run inside fluxer_desktop/ where electron-builder wrote
-        # dist-electron/win-unpacked.  Output lands at fluxer_desktop/velopack-release/.
         working-directory: fluxer_desktop
         run: |
           vpk pack `
@@ -253,44 +334,77 @@ jobs:
             --mainExe "${{ steps.detect-exe.outputs.MAIN_EXE }}" `
             --outputDir velopack-release
 
+      # =====================================================================
+      # 3. Verify Velopack output
+      #    Instead of hardcoding exact filenames (which has broken three times
+      #    now), we glob for the expected patterns and assert exactly the
+      #    expected count. This way if Velopack changes its naming convention
+      #    again, we fail loudly with a useful diagnostic instead of silently
+      #    uploading nothing.
+      # =====================================================================
       - name: Verify Velopack output
+        id: verify
         working-directory: fluxer_desktop
         run: |
-          # Verify all expected output files exist before uploading.
-          # Velopack output filenames: {packId}-{ver}-full.nupkg, {packId}-Setup.exe,
-          # releases.win.json, RELEASES (legacy).
           $packId = "${{ env.VELOPACK_PACK_ID }}"
           $version = "${{ inputs.build_version }}"
           $outDir = "velopack-release"
 
-          $requiredFiles = @(
-            "$outDir\releases.win.json",
-            "$outDir\$packId-$version-full.nupkg",
-            "$outDir\$packId-Setup.exe"
-          )
-
-          $missing = @()
-          foreach ($f in $requiredFiles) {
-            if (-not (Test-Path $f)) {
-              $missing += $f
-            }
-          }
-
-          if ($missing.Count -gt 0) {
-            Write-Host "::error::Missing expected Velopack output files:"
-            foreach ($f in $missing) {
-              Write-Host "::error::  $f"
-            }
+          # --- Verify releases.win.json exists (exact name, channel-dependent) ---
+          if (-not (Test-Path "$outDir\releases.win.json")) {
+            Write-Host "::error::Missing releases.win.json — the auto-updater feed."
             Write-Host "::error::Actual contents of ${outDir}:"
             Get-ChildItem $outDir | ForEach-Object { Write-Host "::error::  $($_.Name)" }
             exit 1
           }
 
+          # --- Find the installer by glob: {packId}-*Setup.exe ---
+          # Velopack embeds the channel in the name (e.g. {packId}-win-Setup.exe).
+          # We do NOT hardcode the channel — we glob and assert exactly one match.
+          $setupFiles = @(Get-ChildItem "$outDir" -Filter "$packId-*Setup.exe")
+          if ($setupFiles.Count -ne 1) {
+            Write-Host "::error::Expected exactly 1 file matching '$packId-*Setup.exe', found $($setupFiles.Count)."
+            Write-Host "::error::Actual contents of ${outDir}:"
+            Get-ChildItem $outDir | ForEach-Object { Write-Host "::error::  $($_.Name)" }
+            exit 1
+          }
+          $setupExe = $setupFiles[0].Name
+          Write-Host "Installer: $setupExe"
+          echo "SETUP_EXE=$setupExe" >> $env:GITHUB_OUTPUT
+
+          # --- Find the .nupkg by glob: {packId}-{version}-full.nupkg ---
+          # The version IS predictable, but we still glob to be safe.
+          $nupkgFiles = @(Get-ChildItem "$outDir" -Filter "$packId-*-full.nupkg")
+          if ($nupkgFiles.Count -ne 1) {
+            Write-Host "::error::Expected exactly 1 file matching '$packId-*-full.nupkg', found $($nupkgFiles.Count)."
+            Write-Host "::error::Actual contents of ${outDir}:"
+            Get-ChildItem $outDir | ForEach-Object { Write-Host "::error::  $($_.Name)" }
+            exit 1
+          }
+          $nupkg = $nupkgFiles[0].Name
+          Write-Host "Package: $nupkg"
+          echo "NUPKG=$nupkg" >> $env:GITHUB_OUTPUT
+
+          # --- Find the Portable zip by glob: {packId}-*Portable.zip ---
+          $portableFiles = @(Get-ChildItem "$outDir" -Filter "$packId-*Portable.zip")
+          if ($portableFiles.Count -eq 1) {
+            $portable = $portableFiles[0].Name
+            Write-Host "Portable: $portable"
+            echo "PORTABLE_ZIP=$portable" >> $env:GITHUB_OUTPUT
+          } elseif ($portableFiles.Count -eq 0) {
+            Write-Host "No Portable zip found (optional — skipping)"
+            echo "PORTABLE_ZIP=" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "::error::Expected 0 or 1 file matching '$packId-*Portable.zip', found $($portableFiles.Count)."
+            exit 1
+          }
+
+          Write-Host ""
           Write-Host "Velopack output verified:"
           Get-ChildItem $outDir | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length / 1MB, 1)) MB)" }
 
       # =====================================================================
-      # 7. Authenticate to GCP via Workload Identity Federation
+      # 4. Authenticate to GCP via Workload Identity Federation
       #    No service account JSON keys — the GitHub OIDC token is exchanged
       #    for a short-lived GCP access token via the WIF provider.
       # =====================================================================
@@ -305,21 +419,28 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       # =====================================================================
-      # 8. Upload Velopack release to GCS
-      #    - releases.win.json: no-cache (UpdateManager reads this to find updates)
-      #    - RELEASES: no-cache (legacy feed for Squirrel migration)
-      #    - .nupkg packages: immutable (uniquely named per version)
-      #    - {packId}-Setup.exe: no-cache (first-time installer)
-      #    The feed path matches the client's URL construction.
+      # 5. Upload Velopack release to GCS
+      #    Uses the filenames discovered by the verify step — never hardcoded.
+      #
+      #    Cache policy:
+      #    - releases.win.json: no-cache (UpdateManager polls this)
+      #    - RELEASES: no-cache (legacy feed)
+      #    - .nupkg: immutable (uniquely named per version)
+      #    - Setup.exe: no-cache (overwritten each build, first-time installer)
+      #    - Portable.zip: no-cache (overwritten each build)
+      #
+      #    NOT uploaded:
+      #    - assets.win.json: build manifest for Velopack deploy commands only,
+      #      not needed by the auto-updater or end users.
       # =====================================================================
       - name: Upload Velopack release to GCS
-        # vpk wrote its output to fluxer_desktop/velopack-release/.
         working-directory: fluxer_desktop
         run: |
-          $packId = "${{ env.VELOPACK_PACK_ID }}"
+          $setupExe = "${{ steps.verify.outputs.SETUP_EXE }}"
+          $nupkg = "${{ steps.verify.outputs.NUPKG }}"
+          $portableZip = "${{ steps.verify.outputs.PORTABLE_ZIP }}"
 
           # Upload releases.win.json — the modern feed file that UpdateManager reads.
-          # Without this file, the client's auto-updater will never find updates.
           gcloud storage cp `
             "velopack-release/releases.win.json" `
             "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/releases.win.json" `
@@ -333,28 +454,31 @@ jobs:
               --cache-control="no-cache"
           }
 
-          # Upload .nupkg packages with long cache (immutable, uniquely named)
+          # Upload .nupkg package with long cache (immutable, uniquely named per version)
           gcloud storage cp `
-            "velopack-release/*.nupkg" `
-            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/" `
+            "velopack-release/$nupkg" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/$nupkg" `
             --cache-control="public, max-age=31536000, immutable"
 
-          # Upload Setup.exe (Velopack names it {packId}-Setup.exe)
+          # Upload installer (discovered name, not hardcoded)
           gcloud storage cp `
-            "velopack-release/$packId-Setup.exe" `
-            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/$packId-Setup.exe" `
+            "velopack-release/$setupExe" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/$setupExe" `
             --cache-control="no-cache"
 
+          # Upload Portable zip if it exists — useful for users who cannot
+          # run an installer (e.g. locked-down corporate machines, USB sticks).
+          if ($portableZip) {
+            gcloud storage cp `
+              "velopack-release/$portableZip" `
+              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/$portableZip" `
+              --cache-control="no-cache"
+          }
+
       # =====================================================================
-      # 9. Attach Velopack Setup as a workflow artifact
-      #    Velopack names the installer {packId}-Setup.exe.
-      #    It is already uploaded to GCS in step 8 above.  We also attach it
-      #    as a GitHub Actions artifact so an operator can hand it to someone
-      #    directly from the run page without GCS access.
-      #
-      #    NOTE: electron-builder.config.cjs sets winTargets = [{ target: 'dir' }]
-      #    and the build step uses --dir, so NO NSIS installer is produced.
-      #    The only first-install .exe is the Velopack Setup.
+      # 6. Attach Velopack installer + Portable zip as workflow artifacts
+      #    Available from the GitHub Actions run page for operators who need
+      #    to hand the installer to someone without GCS access.
       #
       #    actions/upload-artifact resolves `path` relative to the workspace
       #    root ($GITHUB_WORKSPACE), NOT to working-directory.
@@ -363,12 +487,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fluxer-desktop-installer-${{ inputs.build_version }}
-          path: fluxer_desktop/velopack-release/${{ env.VELOPACK_PACK_ID }}-Setup.exe
+          path: fluxer_desktop/velopack-release/${{ steps.verify.outputs.SETUP_EXE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach Portable zip as workflow artifact
+        if: steps.verify.outputs.PORTABLE_ZIP != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxer-desktop-portable-${{ inputs.build_version }}
+          path: fluxer_desktop/velopack-release/${{ steps.verify.outputs.PORTABLE_ZIP }}
           if-no-files-found: warn
           retention-days: 30
 
       # =====================================================================
-      # 10. Prune old releases — keep current + previous only
+      # 7. Prune old releases — keep current + previous only
       #
       #     WHY NOT A GCS LIFECYCLE RULE:
       #     Lifecycle rules operate on object age or noncurrent version count.
@@ -386,8 +519,8 @@ jobs:
       #     3. Sort by version descending.
       #     4. Keep the two most recent versions' files.
       #     5. Delete everything older.
-      #     6. Never delete releases.win.json, RELEASES, or *-Setup.exe
-      #        (always current — overwritten each build).
+      #     6. Never delete releases.win.json, RELEASES, Setup.exe, or
+      #        Portable.zip (always current — overwritten each build).
       #
       #     SAFETY: if there are 2 or fewer versions, nothing is deleted.
       # =====================================================================
