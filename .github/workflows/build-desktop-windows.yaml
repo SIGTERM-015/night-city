@@ -11,7 +11,7 @@
 #   4. Authenticates to GCP via Workload Identity Federation (no JSON keys).
 #   5. Uploads the Velopack release to the GCS download bucket at the correct
 #      feed path so the client's built-in auto-updater can consume it.
-#   6. Uploads the NSIS installer as a convenience artifact for first-time installs.
+#   6. Attaches the Velopack Setup.exe as a workflow artifact for first-time installs.
 #   7. Prunes old releases, keeping only current + previous.
 #
 # WHY workflow_dispatch WITH A COMMIT SHA:
@@ -169,6 +169,14 @@ jobs:
           PUBLIC_RELEASE_CHANNEL: ${{ env.PUBLIC_RELEASE_CHANNEL }}
           PUBLIC_BUILD_VERSION: ${{ inputs.build_version }}
           FLUXER_DESKTOP_BUILD_VARIANT: ${{ env.FLUXER_DESKTOP_BUILD_VARIANT }}
+        # working-directory ES OBLIGATORIO. En la raiz del monorepo el script
+        # "build" es `cargo run -p fluxer-dev -- build`, y el crate fluxer-dev
+        # NO compila en Windows (tools/dev/src/tunnel.rs:372 usa
+        # std::os::unix::net sin guarda #[cfg(unix)]). Ademas electron-builder
+        # solo es dependencia de fluxer_desktop, no de la raiz.
+        # Dentro de fluxer_desktop, "build" es `node scripts/build.mjs`, que es
+        # lo que queremos.
+        working-directory: fluxer_desktop
         run: |
           pnpm build
           pnpm exec electron-builder --dir --config electron-builder.config.cjs
@@ -188,6 +196,9 @@ jobs:
         run: dotnet tool install -g vpk
 
       - name: Pack Velopack release
+        # Must run inside fluxer_desktop/ where electron-builder wrote
+        # dist-electron/win-unpacked.  Output lands at fluxer_desktop/velopack-release/.
+        working-directory: fluxer_desktop
         run: |
           vpk pack `
             --packId Fluxer `
@@ -218,6 +229,8 @@ jobs:
       #    The feed path matches the client's URL construction.
       # =====================================================================
       - name: Upload Velopack release to GCS
+        # vpk wrote its output to fluxer_desktop/velopack-release/.
+        working-directory: fluxer_desktop
         run: |
           # Upload RELEASES file with no-cache (feed metadata must be fresh)
           gcloud storage cp `
@@ -240,32 +253,24 @@ jobs:
           }
 
       # =====================================================================
-      # 9. Upload NSIS installer as a convenience artifact
-      #    The NSIS installer is for first-time installs only — the Velopack
-      #    updater handles upgrades. We upload it to GCS alongside the feed
-      #    and also attach it as a GitHub Actions artifact.
+      # 9. Attach Velopack Setup.exe as a workflow artifact
+      #    The Setup.exe is Velopack's bootstrapper for first-time installs.
+      #    It is already uploaded to GCS in step 8 above.  We also attach it
+      #    as a GitHub Actions artifact so an operator can hand it to someone
+      #    directly from the run page without GCS access.
+      #
+      #    NOTE: electron-builder.config.cjs sets winTargets = [{ target: 'dir' }]
+      #    and the build step uses --dir, so NO NSIS installer is produced.
+      #    The only first-install .exe is the Velopack Setup.exe.
+      #
+      #    actions/upload-artifact resolves `path` relative to the workspace
+      #    root ($GITHUB_WORKSPACE), NOT to working-directory.
       # =====================================================================
-      - name: Upload NSIS installer to GCS
-        run: |
-          $installer = Get-ChildItem -Path "dist-electron" -Filter "*.exe" -File |
-            Where-Object { $_.Name -match "Setup" -or $_.Name -match "Install" } |
-            Select-Object -First 1
-
-          if ($installer) {
-            gcloud storage cp `
-              $installer.FullName `
-              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/nsis/$($installer.Name)" `
-              --cache-control="no-cache"
-            Write-Host "Uploaded NSIS installer: $($installer.Name)"
-          } else {
-            Write-Host "No NSIS installer found in dist-electron/ — skipping"
-          }
-
-      - name: Attach NSIS installer as workflow artifact
+      - name: Attach Velopack installer as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fluxer-desktop-nsis-${{ inputs.build_version }}
-          path: dist-electron/*Setup*.exe
+          name: fluxer-desktop-installer-${{ inputs.build_version }}
+          path: fluxer_desktop/velopack-release/Setup.exe
           if-no-files-found: warn
           retention-days: 30
 
