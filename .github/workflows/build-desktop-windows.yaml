@@ -45,6 +45,10 @@ on:
           Must match the commit used for the Cloud Build image pipeline.
         required: true
         type: string
+      fork_ref:
+        description: "Branch or tag of THIS fork to build (carries our patches). Normally 'main'."
+        required: true
+        default: main
       build_version:
         description: >
           Version string for the build (e.g. "2026.802.120000").
@@ -89,13 +93,38 @@ jobs:
 
     steps:
       # =====================================================================
-      # 1. Checkout the fork at the specified upstream commit
+      # 1. Checkout THIS fork's branch (which carries our patches) and then
+      #    assert that it is based on the requested upstream commit.
+      #
+      #    Checking out `inputs.upstream_commit_sha` directly would be wrong:
+      #    that SHA is upstream's commit, which by definition does NOT contain
+      #    our fork patches (they are a later commit). The build would silently
+      #    produce a client pointing at web.canary.fluxer.app and at Fluxer's
+      #    update API instead of our instance and our bucket.
+      #
+      #    Instead we build the fork ref and verify its ancestry, so a mismatch
+      #    fails loudly rather than shipping a wrongly-configured client.
       # =====================================================================
-      - name: Checkout
+      - name: Checkout fork
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.upstream_commit_sha }}
-          fetch-depth: 1
+          ref: ${{ inputs.fork_ref }}
+          fetch-depth: 0
+
+      - name: Verify fork is based on the requested upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/fluxerapp/fluxer.git
+          git fetch --no-tags upstream "${{ inputs.upstream_commit_sha }}"
+          if ! git merge-base --is-ancestor "${{ inputs.upstream_commit_sha }}" HEAD; then
+            echo "::error::HEAD is not a descendant of ${{ inputs.upstream_commit_sha }}."
+            echo "::error::Server images and client must come from the same upstream base"
+            echo "::error::or the voice-engine bridge versions can diverge and the client"
+            echo "::error::will crash fatally at startup."
+            exit 1
+          fi
+          echo "OK: $(git rev-parse HEAD) descends from ${{ inputs.upstream_commit_sha }}"
 
       # =====================================================================
       # 2. Setup Node.js 24
