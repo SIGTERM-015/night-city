@@ -71,7 +71,12 @@ function getDesktopDownloadArch(arch: NodeJS.Architecture): DesktopDownloadArch 
 }
 
 const DESKTOP_DOWNLOAD_ARCH = getDesktopDownloadArch(process.arch);
-const UPDATE_API_ENDPOINT = BUILD_CHANNEL === 'canary' ? 'https://api.canary.fluxer.app' : 'https://api.fluxer.app';
+// PARCHE DEL FORK (night-city): el feed de actualizaciones apunta a nuestro
+// bucket de GCS en vez de a la API de Fluxer. Velopack solo necesita un
+// servidor estatico, y el cliente sigue construyendo la ruta
+//   /dl/desktop/{canal}/{plataforma}/{arch}/{variante}
+// por si sola, asi que la jerarquia se reproduce dentro del bucket.
+const UPDATE_API_ENDPOINT = 'https://storage.googleapis.com/nka-fluxer-desktop';
 const UPDATE_VARIANT_SEGMENT =
 	process.platform === 'win32' && DESKTOP_BUILD_VARIANT !== 'default' ? `/${DESKTOP_BUILD_VARIANT}` : '';
 const UPDATE_BASE_URL = `${UPDATE_API_ENDPOINT}/dl/desktop/${BUILD_CHANNEL}/${process.platform}/${DESKTOP_DOWNLOAD_ARCH}${UPDATE_VARIANT_SEGMENT}`;

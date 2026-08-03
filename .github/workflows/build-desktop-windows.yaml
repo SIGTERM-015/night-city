@@ -1,0 +1,314 @@
+# =============================================================================
+# Fluxer Desktop Client — Windows Build + Velopack Publish
+#
+# LOCATION: This file lives in the IaC repo at ci/github/build-desktop-windows.yaml.
+#           Copy it to the fork at .github/workflows/build-desktop-windows.yaml.
+#
+# WHAT IT DOES:
+#   1. Checks out the Fluxer fork at a specific upstream commit SHA.
+#   2. Builds the Electron desktop client with the windows-game-capture variant.
+#   3. Packs the build output into a Velopack release (vpk pack).
+#   4. Authenticates to GCP via Workload Identity Federation (no JSON keys).
+#   5. Uploads the Velopack release to the GCS download bucket at the correct
+#      feed path so the client's built-in auto-updater can consume it.
+#   6. Uploads the NSIS installer as a convenience artifact for first-time installs.
+#   7. Prunes old releases, keeping only current + previous.
+#
+# WHY workflow_dispatch WITH A COMMIT SHA:
+#   The desktop client is hard-coupled to the app-proxy image via bridgeVersion.
+#   A mismatch is a fatal crash at startup. By requiring the same commit SHA
+#   that was used for the Cloud Build image pipeline, we guarantee the client
+#   and server are built from the same source. This eliminates the bridge
+#   version coupling that has caused repeated fatal client crashes.
+#
+# PREREQUISITES:
+#   - The GCS bucket "nka-fluxer-desktop" must exist (created by Pulumi).
+#   - The fork must have UPDATE_API_ENDPOINT patched to
+#     https://storage.googleapis.com/nka-fluxer-desktop
+#   - Workload Identity Federation must be configured (created by Pulumi).
+#
+# VELOPACK FEED PATH:
+#   The client constructs its update URL as:
+#     ${UPDATE_API_ENDPOINT}/dl/desktop/${BUILD_CHANNEL}/${process.platform}/${DESKTOP_DOWNLOAD_ARCH}/${DESKTOP_BUILD_VARIANT}
+#   For our build: dl/desktop/canary/win32/x64/windows-game-capture/
+#   The Velopack RELEASES file and .nupkg packages go under this prefix.
+# =============================================================================
+
+name: Build Desktop Client (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_commit_sha:
+        description: >
+          Full 40-character SHA from fluxerapp/fluxer to build.
+          Must match the commit used for the Cloud Build image pipeline.
+        required: true
+        type: string
+      build_version:
+        description: >
+          Version string for the build (e.g. "2026.802.120000").
+          Used as PUBLIC_BUILD_VERSION and the Velopack package version.
+        required: true
+        type: string
+
+# Permissions for Workload Identity Federation OIDC token exchange.
+permissions:
+  contents: read
+  id-token: write
+
+# Only one desktop build at a time — a concurrent upload could corrupt
+# the feed by interleaving files from two releases.
+concurrency:
+  group: desktop-build
+  cancel-in-progress: false
+
+env:
+  # --- Build configuration ---
+  BUILD_CHANNEL: canary
+  PUBLIC_RELEASE_CHANNEL: canary
+  FLUXER_DESKTOP_BUILD_VARIANT: windows-game-capture
+  DESKTOP_DOWNLOAD_ARCH: x64
+  PLATFORM: win32
+
+  # --- GCP configuration ---
+  # These must match the Pulumi stack outputs.
+  GCS_BUCKET: nka-fluxer-desktop
+  WIF_PROVIDER: projects/502629968490/locations/global/workloadIdentityPools/fluxer-desktop-ci/providers/github-actions
+  SERVICE_ACCOUNT: fluxer-desktop-ci@devops-sandbox-nka.iam.gserviceaccount.com
+
+  # --- Feed path ---
+  # Matches the client's URL construction:
+  #   ${UPDATE_API_ENDPOINT}/dl/desktop/${BUILD_CHANNEL}/${PLATFORM}/${ARCH}/${VARIANT}/
+  FEED_PREFIX: dl/desktop/canary/win32/x64/windows-game-capture
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      # =====================================================================
+      # 1. Checkout the fork at the specified upstream commit
+      # =====================================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.upstream_commit_sha }}
+          fetch-depth: 1
+
+      # =====================================================================
+      # 2. Setup Node.js 24
+      #    Their CI uses Node 24. Node 25 dropped corepack, so we install
+      #    pnpm manually via npm.
+      # =====================================================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.29.3
+
+      # =====================================================================
+      # 3. Setup Rust with both x86_64 and i686 MSVC targets
+      #    The windows-game-capture variant needs 32-bit artifacts even for
+      #    an x64 build (the game capture hook DLL must be 32-bit to inject
+      #    into 32-bit games).
+      # =====================================================================
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc
+
+      # =====================================================================
+      # 4. Install dependencies
+      # =====================================================================
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # =====================================================================
+      # 5. Build the application
+      #    We run the two commands that dev:desktop:package would have run,
+      #    because the fluxer-dev crate does not compile on Windows
+      #    (tools/dev/src/tunnel.rs:372 uses std::os::unix::net without
+      #    a #[cfg(unix)] guard).
+      # =====================================================================
+      - name: Build application
+        env:
+          BUILD_CHANNEL: ${{ env.BUILD_CHANNEL }}
+          PUBLIC_RELEASE_CHANNEL: ${{ env.PUBLIC_RELEASE_CHANNEL }}
+          PUBLIC_BUILD_VERSION: ${{ inputs.build_version }}
+          FLUXER_DESKTOP_BUILD_VARIANT: ${{ env.FLUXER_DESKTOP_BUILD_VARIANT }}
+        run: |
+          pnpm build
+          pnpm exec electron-builder --dir --config electron-builder.config.cjs
+
+      # =====================================================================
+      # 6. Pack with Velopack
+      #    electron-builder produces an unpacked directory at
+      #    dist-electron/win-unpacked. Velopack's vpk pack turns this into
+      #    the release artifacts the auto-updater expects: a RELEASES file
+      #    and .nupkg packages.
+      #
+      #    electron-builder does NOT produce Velopack packages — it produces
+      #    NSIS installers. Without this step we would publish installers to
+      #    a feed the client's Velopack UpdateManager cannot read.
+      # =====================================================================
+      - name: Install Velopack CLI
+        run: dotnet tool install -g vpk
+
+      - name: Pack Velopack release
+        run: |
+          vpk pack `
+            --packId Fluxer `
+            --packVersion ${{ inputs.build_version }} `
+            --packDir dist-electron/win-unpacked `
+            --mainExe Fluxer.exe `
+            --outputDir velopack-release
+
+      # =====================================================================
+      # 7. Authenticate to GCP via Workload Identity Federation
+      #    No service account JSON keys — the GitHub OIDC token is exchanged
+      #    for a short-lived GCP access token via the WIF provider.
+      # =====================================================================
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # =====================================================================
+      # 8. Upload Velopack release to GCS
+      #    - RELEASES file: no-cache (clients must see new releases immediately)
+      #    - .nupkg packages: immutable (uniquely named per version)
+      #    The feed path matches the client's URL construction.
+      # =====================================================================
+      - name: Upload Velopack release to GCS
+        run: |
+          # Upload RELEASES file with no-cache (feed metadata must be fresh)
+          gcloud storage cp `
+            "velopack-release/RELEASES" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/RELEASES" `
+            --cache-control="no-cache"
+
+          # Upload .nupkg packages with long cache (immutable, uniquely named)
+          gcloud storage cp `
+            "velopack-release/*.nupkg" `
+            "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/" `
+            --cache-control="public, max-age=31536000, immutable"
+
+          # Upload Setup.exe (Velopack's bootstrapper for first-time installs)
+          if (Test-Path "velopack-release/Setup.exe") {
+            gcloud storage cp `
+              "velopack-release/Setup.exe" `
+              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/Setup.exe" `
+              --cache-control="no-cache"
+          }
+
+      # =====================================================================
+      # 9. Upload NSIS installer as a convenience artifact
+      #    The NSIS installer is for first-time installs only — the Velopack
+      #    updater handles upgrades. We upload it to GCS alongside the feed
+      #    and also attach it as a GitHub Actions artifact.
+      # =====================================================================
+      - name: Upload NSIS installer to GCS
+        run: |
+          $installer = Get-ChildItem -Path "dist-electron" -Filter "*.exe" -File |
+            Where-Object { $_.Name -match "Setup" -or $_.Name -match "Install" } |
+            Select-Object -First 1
+
+          if ($installer) {
+            gcloud storage cp `
+              $installer.FullName `
+              "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/nsis/$($installer.Name)" `
+              --cache-control="no-cache"
+            Write-Host "Uploaded NSIS installer: $($installer.Name)"
+          } else {
+            Write-Host "No NSIS installer found in dist-electron/ — skipping"
+          }
+
+      - name: Attach NSIS installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxer-desktop-nsis-${{ inputs.build_version }}
+          path: dist-electron/*Setup*.exe
+          if-no-files-found: warn
+          retention-days: 30
+
+      # =====================================================================
+      # 10. Prune old releases — keep current + previous only
+      #
+      #     WHY NOT A GCS LIFECYCLE RULE:
+      #     Lifecycle rules operate on object age or noncurrent version count.
+      #     Neither can express "keep the last two releases" when a release is
+      #     a set of files under a prefix. A time-based rule would delete the
+      #     CURRENT release if no build runs for N days — breaking every
+      #     installed client's updater. Correctness matters more than elegance.
+      #
+      #     ALGORITHM:
+      #     1. List all .nupkg files under the feed prefix.
+      #     2. Parse version numbers from filenames.
+      #     3. Sort by version descending.
+      #     4. Keep the two most recent versions' files.
+      #     5. Delete everything older.
+      #     6. Never delete RELEASES or Setup.exe (always current).
+      #
+      #     SAFETY: if there are 2 or fewer versions, nothing is deleted.
+      # =====================================================================
+      - name: Prune old releases
+        run: |
+          Write-Host "Listing existing packages in feed..."
+          $objects = gcloud storage ls "gs://${{ env.GCS_BUCKET }}/${{ env.FEED_PREFIX }}/" 2>$null
+
+          if (-not $objects) {
+            Write-Host "No objects found — nothing to prune"
+            exit 0
+          }
+
+          # Collect .nupkg files and extract versions
+          $packages = @()
+          foreach ($obj in $objects) {
+            if ($obj -match '\.nupkg$') {
+              # Velopack names packages as PackageId-Version-full.nupkg or similar
+              if ($obj -match '-(\d+\.\d+\.\d+)') {
+                $packages += [PSCustomObject]@{
+                  Path = $obj
+                  Version = $Matches[1]
+                }
+              }
+            }
+          }
+
+          if ($packages.Count -eq 0) {
+            Write-Host "No .nupkg packages found — nothing to prune"
+            exit 0
+          }
+
+          # Get unique versions, sorted descending
+          $versions = $packages | Select-Object -ExpandProperty Version -Unique |
+            Sort-Object { [version]$_ } -Descending
+
+          Write-Host "Found versions: $($versions -join ', ')"
+
+          if ($versions.Count -le 2) {
+            Write-Host "2 or fewer versions — nothing to prune"
+            exit 0
+          }
+
+          # Versions to delete: everything beyond the 2 most recent
+          $toDelete = $versions | Select-Object -Skip 2
+
+          foreach ($ver in $toDelete) {
+            $filesToDelete = $packages | Where-Object { $_.Version -eq $ver }
+            foreach ($file in $filesToDelete) {
+              Write-Host "Deleting: $($file.Path)"
+              gcloud storage rm $file.Path
+            }
+          }
+
+          Write-Host "Pruning complete — kept versions: $($versions[0]), $($versions[1])"
